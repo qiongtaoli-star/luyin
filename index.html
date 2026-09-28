@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>本地听写</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎙️</text></svg>">
+<style>
+:root{
+  --bg:#EDF0F3;--surface:#FFFFFF;--ink:#17202B;--muted:#6B7684;--line:#D5DBE2;
+  --accent:#1F5FD1;--pending:#B8C2CE;--danger:#C0392B;
+  box-sizing:border-box;
+  padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);
+  font-family:-apple-system,"PingFang SC","Noto Sans SC","Microsoft YaHei",system-ui,sans-serif;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#12171D;--surface:#1A2129;--ink:#E6EBF0;--muted:#8C97A4;--line:#2A333D;--accent:#6FA0FF;--pending:#3A4450;--danger:#FF7A6B;}}
+:root[data-theme="dark"]{--bg:#12171D;--surface:#1A2129;--ink:#E6EBF0;--muted:#8C97A4;--line:#2A333D;--accent:#6FA0FF;--pending:#3A4450;--danger:#FF7A6B;}
+*,*::before,*::after{box-sizing:inherit}
+body{margin:0;background:var(--bg);color:var(--ink);line-height:1.6}
+main{max-width:860px;margin:0 auto;padding:2rem 1.25rem 4rem}
+h1{font-size:2rem;font-weight:700;letter-spacing:.02em;margin:0 0 .25rem}
+.lede{color:var(--muted);margin:0 0 1.75rem;max-width:40em}
+.row{display:flex;flex-wrap:wrap;gap:.75rem 1.25rem;align-items:center;margin-bottom:1rem}
+label{display:flex;gap:.5rem;align-items:center;font-size:.95rem}
+select,button{font:inherit;color:inherit}
+select{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:.35rem .5rem}
+button{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:.45rem .9rem;cursor:pointer}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button:disabled{opacity:.45;cursor:not-allowed}
+button:focus-visible,select:focus-visible,[contenteditable]:focus-visible,time:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+#rec.on{border-color:var(--danger);color:var(--danger)}
+.tag{font-size:.85rem;color:var(--muted)}
+.drop{border:1.5px dashed var(--line);border-radius:10px;padding:1.25rem;text-align:center;color:var(--muted);transition:border-color .15s}
+.drop.over{border-color:var(--accent);color:var(--ink)}
+.drop .row{justify-content:center;margin:.75rem 0 0}
+.deck{margin-top:1.25rem;background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:1rem}
+canvas{display:block;width:100%;height:88px;cursor:pointer}
+.status{font-size:.9rem;color:var(--muted);margin:.6rem 0;min-height:1.5em}
+audio{width:100%;margin-top:.5rem}
+#out{margin-top:1.5rem}
+#out p{display:grid;grid-template-columns:5.5rem 1fr;gap:.75rem;margin:0;padding:.45rem 0;border-bottom:1px solid var(--line)}
+#out time{color:var(--accent);font-variant-numeric:tabular-nums;cursor:pointer;font-size:.9rem;padding-top:.1rem}
+#out span{outline:none;border-radius:3px}
+.empty{color:var(--muted);text-align:center;padding:2rem 0}
+[hidden]{display:none!important}
+@media (max-width:560px){#out p{grid-template-columns:1fr;gap:0}h1{font-size:1.6rem}}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<main>
+  <h1>本地听写</h1>
+  <p class="lede">在浏览器里运行 Whisper，音频不上传任何服务器。模型第一次使用时下载并缓存，之后断网也能用。</p>
+
+  <div class="row">
+    <label>模型
+      <select id="model">
+        <option value="onnx-community/whisper-base">base：最快，准确度一般</option>
+        <option value="onnx-community/whisper-small" selected>small：中文推荐</option>
+        <option value="onnx-community/whisper-large-v3-turbo">large-v3-turbo：最准，建议有 WebGPU</option>
+      </select>
+    </label>
+    <label>语言
+      <select id="lang">
+        <option value="chinese">中文</option>
+        <option value="english">英语</option>
+        <option value="japanese">日语</option>
+        <option value="">自动识别</option>
+      </select>
+    </label>
+    <span class="tag" id="device">正在检测硬件加速…</span>
+  </div>
+
+  <div class="drop" id="drop">
+    把录音或视频文件拖到这里
+    <div class="row">
+      <button id="pick">选择文件</button>
+      <button id="rec">开始录音</button>
+      <input type="file" id="file" accept="audio/*,video/*" hidden>
+    </div>
+  </div>
+
+  <div class="deck" id="deck" hidden>
+    <canvas id="wave" aria-label="音频波形，点击跳转播放"></canvas>
+    <div class="status" id="status"></div>
+    <div class="row" style="margin:0">
+      <button class="primary" id="start">开始转写</button>
+      <button id="stop" disabled>暂停</button>
+      <span class="tag" id="fname"></span>
+    </div>
+    <audio id="player" controls></audio>
+  </div>
+
+  <section id="out"><div class="empty">转写结果会逐段出现在这里。点时间戳可以跳到对应位置播放，文字可以直接修改。</div></section>
+
+  <div class="row" style="margin-top:1rem" id="exports" hidden>
+    <button id="copy">复制全文</button>
+    <button id="txt">下载 TXT</button>
+    <button id="srt">下载 SRT 字幕</button>
+    <button id="clear">清空结果</button>
+  </div>
+</main>
+
+<script type="module">
+// ---------- Worker：模型加载与推理放在后台线程，页面不会卡 ----------
+const workerSrc = `
+import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.1';
+env.allowLocalModels = false;
+let asr = null, loaded = '', device = 'wasm';
+async function hasGPU(){ try{ return !!(navigator.gpu && await navigator.gpu.requestAdapter()); }catch{ return false; } }
+const progress = p => self.postMessage({ type:'dl', p });
+async function load(model){
+  if (asr && loaded === model) return device;
+  if (asr) { try{ await asr.dispose(); }catch{} asr = null; }
+  device = (await hasGPU()) ? 'webgpu' : 'wasm';
+  try {
+    asr = await pipeline('automatic-speech-recognition', model, {
+      device, progress_callback: progress,
+      dtype: device === 'webgpu' ? { encoder_model:'fp32', decoder_model_merged:'q4' } : 'q8'
+    });
+  } catch (err) {
+    if (device !== 'webgpu') throw err;
+    device = 'wasm';
+    asr = await pipeline('automatic-speech-recognition', model, { device, dtype:'q8', progress_callback: progress });
+  }
+  loaded = model;
+  return device;
+}
+self.onmessage = async (e) => {
+  const m = e.data;
+  try {
+    if (m.type === 'probe') self.postMessage({ id:m.id, gpu: await hasGPU() });
+    if (m.type === 'load') self.postMessage({ id:m.id, device: await load(m.model) });
+    if (m.type === 'run') {
+      const opts = { task:'transcribe', return_timestamps:true };
+      if (m.language) opts.language = m.language;
+      const out = await asr(m.audio, opts);
+      self.postMessage({ id:m.id, out });
+    }
+  } catch (err) { self.postMessage({ id:m.id, error: String(err && err.message || err) }); }
+};`;
+const worker = new Worker(URL.createObjectURL(new Blob([workerSrc], { type:'text/javascript' })), { type:'module' });
+let seq = 0; const pending = new Map(); const dl = {};
+worker.onmessage = (e) => {
+  const m = e.data;
+  if (m.type === 'dl') {
+    const p = m.p;
+    if (p.status === 'progress' && p.total) {
+      dl[p.file] = [p.loaded, p.total];
+      let a = 0, b = 0; for (const [x, y] of Object.values(dl)) { a += x; b += y; }
+      setStatus(`正在下载模型 ${(a/1048576).toFixed(0)} / ${(b/1048576).toFixed(0)} MB（只需下载一次）`);
+    }
+    return;
+  }
+  const h = pending.get(m.id); if (!h) return; pending.delete(m.id);
+  m.error ? h.reject(new Error(m.error)) : h.resolve(m);
+};
+const ask = (msg, transfer = []) => new Promise((resolve, reject) => {
+  const id = ++seq; pending.set(id, { resolve, reject }); worker.postMessage({ ...msg, id }, transfer);
+});
+
+// ---------- 状态 ----------
+const SR = 16000, WIN = 30 * SR;
+const $ = (id) => document.getElementById(id);
+let audio = null, fileURL = '', nextIdx = 0, running = false, stopReq = false, segs = [], wakeLock = null;
+const setStatus = (t) => $('status').textContent = t;
+
+ask({ type:'probe' }).then(r => $('device').textContent = r.gpu ? '已启用 WebGPU 加速' : '未检测到 WebGPU，使用 CPU（较慢）');
+
+// ---------- 读取音频：解码并重采样为 16 kHz 单声道 ----------
+async function decode(file) {
+  const ctx = new AudioContext({ sampleRate: SR });
+  try {
+    const ab = await ctx.decodeAudioData(await file.arrayBuffer());
+    if (ab.numberOfChannels === 1) return ab.getChannelData(0);
+    const out = new Float32Array(ab.length);
+    for (let c = 0; c < ab.numberOfChannels; c++) {
+      const d = ab.getChannelData(c); for (let i = 0; i < d.length; i++) out[i] += d[i] / ab.numberOfChannels;
+    }
+    return out;
+  } finally { ctx.close(); }
+}
+
+async function loadFile(file) {
+  if (running) return;
+  $('deck').hidden = false; $('fname').textContent = file.name;
+  setStatus('正在解码音频…');
+  try { audio = await decode(file); }
+  catch { setStatus('无法解码这个文件。请换成 mp3、m4a、wav 或 mp4，或先用 ffmpeg 转码。'); audio = null; return; }
+  if (fileURL) URL.revokeObjectURL(fileURL);
+  fileURL = URL.createObjectURL(file); $('player').src = fileURL;
+  nextIdx = 0; segs = []; renderAll();
+  computePeaks(); drawWave();
+  setStatus(`时长 ${fmt(audio.length / SR)}，准备就绪`);
+  $('start').textContent = '开始转写'; $('start').disabled = false;
+}
+
+// ---------- 波形：已转写部分着色，同时充当进度条 ----------
+let peaks = [];
+function computePeaks() {
+  const c = $('wave'), n = Math.max(60, Math.floor(c.clientWidth / 3));
+  const step = Math.floor(audio.length / n) || 1; peaks = [];
+  for (let i = 0; i < n; i++) {
+    let m = 0; const s = i * step, e = Math.min(s + step, audio.length);
+    for (let j = s; j < e; j += 16) { const v = Math.abs(audio[j]); if (v > m) m = v; }
+    peaks.push(m);
+  }
+  const mx = Math.max(...peaks, 1e-4); peaks = peaks.map(p => p / mx);
+}
+function drawWave() {
+  const c = $('wave'), dpr = devicePixelRatio || 1, w = c.clientWidth, h = c.clientHeight;
+  c.width = w * dpr; c.height = h * dpr; const g = c.getContext('2d'); g.scale(dpr, dpr);
+  const cs = getComputedStyle(document.documentElement);
+  const done = audio ? Math.min(1, nextIdx / audio.length) : 0, bw = w / peaks.length;
+  peaks.forEach((p, i) => {
+    g.fillStyle = (i / peaks.length) < done ? cs.getPropertyValue('--accent') : cs.getPropertyValue('--pending');
+    const bh = Math.max(2, p * (h - 4)); g.fillRect(i * bw, (h - bh) / 2, Math.max(1, bw - 1), bh);
+  });
+}
+$('wave').addEventListener('click', (e) => {
+  if (!audio) return; const r = e.currentTarget.getBoundingClientRect();
+  $('player').currentTime = ((e.clientX - r.left) / r.width) * audio.length / SR; $('player').play();
+});
+addEventListener('resize', () => { if (audio) { computePeaks(); drawWave(); } });
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => audio && drawWave());
+
+// ---------- 转写主循环：每 30 秒一段，逐段输出，可暂停/继续 ----------
+async function run() {
+  if (!audio || running) return;
+  running = true; stopReq = false;
+  $('start').disabled = true; $('stop').disabled = false; $('model').disabled = true;
+  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
+  try {
+    setStatus('正在加载模型…');
+    const r = await ask({ type:'load', model: $('model').value });
+    $('device').textContent = r.device === 'webgpu' ? '已启用 WebGPU 加速' : '使用 CPU 运行';
+    const t0 = performance.now(), startIdx = nextIdx;
+    while (nextIdx < audio.length && !stopReq) {
+      const end = Math.min(nextIdx + WIN, audio.length), slice = audio.slice(nextIdx, end), off = nextIdx / SR;
+      let rms = 0; for (let i = 0; i < slice.length; i += 8) rms += slice[i] * slice[i];
+      rms = Math.sqrt(rms / (slice.length / 8));
+      if (rms > 0.003 && slice.length > SR / 2) {       // 跳过静音段，减少 Whisper 的幻觉输出
+        const res = await ask({ type:'run', audio: slice, language: $('lang').value }, [slice.buffer]);
+        const chunks = res.out.chunks?.length ? res.out.chunks : [{ timestamp:[0, (end - nextIdx) / SR], text: res.out.text }];
+        for (const ch of chunks) {
+          const text = (ch.text || '').trim(); if (!text) continue;
+          const s = off + (ch.timestamp[0] ?? 0), e = off + (ch.timestamp[1] ?? (end - nextIdx) / SR);
+          const seg = { s, e: Math.max(e, s), text }; segs.push(seg); appendSeg(seg);
+        }
+      }
+      nextIdx = end; drawWave();
+      const el = (performance.now() - t0) / 1000, doneSec = (nextIdx - startIdx) / SR, left = (audio.length - nextIdx) / SR;
+      const eta = doneSec > 0 ? left * el / doneSec : 0;
+      setStatus(`已转写 ${fmt(nextIdx / SR)} / ${fmt(audio.length / SR)}，预计还需 ${fmt(eta)}`);
+    }
+    if (nextIdx >= audio.length) { setStatus(`完成，共 ${segs.length} 段`); $('start').textContent = '重新转写'; }
+    else { setStatus(`已暂停在 ${fmt(nextIdx / SR)}`); $('start').textContent = '继续转写'; }
+  } catch (err) {
+    setStatus('出错：' + err.message + '。可以换小一点的模型，或刷新页面后重试。');
+    $('start').textContent = '继续转写';
+  } finally {
+    running = false; $('start').disabled = false; $('stop').disabled = true; $('model').disabled = false;
+    try { await wakeLock?.release(); } catch {} wakeLock = null;
+  }
+}
+$('start').onclick = () => {
+  if (nextIdx >= (audio?.length ?? 0)) { nextIdx = 0; segs = []; renderAll(); drawWave(); }
+  run();
+};
+$('stop').onclick = () => { stopReq = true; setStatus('当前这一段完成后暂停…'); };
+
+// ---------- 结果展示与编辑 ----------
+function appendSeg(seg) {
+  const out = $('out'); out.querySelector('.empty')?.remove();
+  const p = document.createElement('p'), t = document.createElement('time'), sp = document.createElement('span');
+  t.textContent = fmt(seg.s); t.tabIndex = 0;
+  t.onclick = t.onkeydown = (e) => { if (e.type === 'keydown' && e.key !== 'Enter') return; $('player').currentTime = seg.s; $('player').play(); };
+  sp.textContent = seg.text; sp.contentEditable = 'true'; sp.oninput = () => seg.text = sp.textContent;
+  p.append(t, sp); out.append(p); $('exports').hidden = false;
+}
+function renderAll() {
+  $('out').innerHTML = segs.length ? '' : '<div class="empty">转写结果会逐段出现在这里。点时间戳可以跳到对应位置播放，文字可以直接修改。</div>';
+  segs.forEach(appendSeg); $('exports').hidden = !segs.length;
+}
+
+// ---------- 导出 ----------
+const pad = (n, l = 2) => String(Math.floor(n)).padStart(l, '0');
+function fmt(sec) { sec = Math.max(0, sec); return `${pad(sec / 3600)}:${pad(sec / 60 % 60)}:${pad(sec % 60)}`; }
+const srtT = (s) => `${fmt(s)},${pad((s % 1) * 1000, 3)}`;
+const baseName = () => ($('fname').textContent || 'transcript').replace(/\.[^.]+$/, '');
+function save(text, ext) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type:'text/plain;charset=utf-8' }));
+  a.download = `${baseName()}.${ext}`; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+$('txt').onclick = () => save(segs.map(s => `[${fmt(s.s)}] ${s.text}`).join('\n'), 'txt');
+$('srt').onclick = () => save(segs.map((s, i) => `${i + 1}\n${srtT(s.s)} --> ${srtT(s.e)}\n${s.text}\n`).join('\n'), 'srt');
+$('copy').onclick = async () => {
+  try { await navigator.clipboard.writeText(segs.map(s => s.text).join('\n')); $('copy').textContent = '已复制'; }
+  catch { $('copy').textContent = '复制失败'; }
+  setTimeout(() => $('copy').textContent = '复制全文', 1500);
+};
+$('clear').onclick = () => { if (running) return; segs = []; nextIdx = 0; renderAll(); if (audio) drawWave(); $('start').textContent = '开始转写'; };
+
+// ---------- 文件导入与录音 ----------
+$('pick').onclick = () => $('file').click();
+$('file').onchange = (e) => e.target.files[0] && loadFile(e.target.files[0]);
+const drop = $('drop');
+['dragenter', 'dragover'].forEach(t => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave', 'drop'].forEach(t => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.remove('over'); }));
+drop.addEventListener('drop', (e) => e.dataTransfer.files[0] && loadFile(e.dataTransfer.files[0]));
+
+let rec = null, recChunks = [];
+$('rec').onclick = async () => {
+  if (rec && rec.state === 'recording') { rec.stop(); return; }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    rec = new MediaRecorder(stream); recChunks = [];
+    rec.ondataavailable = (e) => e.data.size && recChunks.push(e.data);
+    rec.onstop = () => {
+      stream.getTracks().forEach(t => t.stop());
+      $('rec').textContent = '开始录音'; $('rec').classList.remove('on');
+      const type = rec.mimeType || 'audio/webm', ext = type.includes('mp4') ? 'm4a' : 'webm';
+      const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-');
+      loadFile(new File(recChunks, `录音-${stamp}.${ext}`, { type }));
+    };
+    rec.start(1000); $('rec').textContent = '停止录音'; $('rec').classList.add('on');
+  } catch { setStatus('无法使用麦克风。请在浏览器地址栏允许麦克风权限，并确认页面是 https 地址。'); $('deck').hidden = false; }
+};
+addEventListener('beforeunload', (e) => { if (running || (rec && rec.state === 'recording')) e.preventDefault(); });
+</script>
+</body>
+</html>
