@@ -56,7 +56,8 @@ audio{width:100%;margin-top:.5rem}
   <div class="row">
     <label>模型
       <select id="model">
-        <option value="onnx-community/whisper-base">base：最快，准确度一般</option>
+        <option value="onnx-community/whisper-tiny">tiny：最省内存，手机可用</option>
+        <option value="onnx-community/whisper-base">base：较快，手机推荐</option>
         <option value="onnx-community/whisper-small" selected>small：中文推荐</option>
         <option value="onnx-community/whisper-large-v3-turbo">large-v3-turbo：最准，建议有 WebGPU</option>
       </select>
@@ -67,6 +68,13 @@ audio{width:100%;margin-top:.5rem}
         <option value="english">英语</option>
         <option value="japanese">日语</option>
         <option value="">自动识别</option>
+      </select>
+    </label>
+    <label>运行方式
+      <select id="dev">
+        <option value="auto">自动</option>
+        <option value="webgpu">显卡 WebGPU</option>
+        <option value="wasm">CPU（最稳）</option>
       </select>
     </label>
     <span class="tag" id="device">正在检测硬件加速…</span>
@@ -107,31 +115,37 @@ audio{width:100%;margin-top:.5rem}
 const workerSrc = `
 import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.1';
 env.allowLocalModels = false;
-let asr = null, loaded = '', device = 'wasm';
-async function hasGPU(){ try{ return !!(navigator.gpu && await navigator.gpu.requestAdapter()); }catch{ return false; } }
+let asr = null, loaded = '', device = 'wasm', adapter = null;
+async function hasGPU(){ try{ adapter = adapter || (navigator.gpu && await navigator.gpu.requestAdapter()); return !!adapter; }catch{ return false; } }
 const progress = p => self.postMessage({ type:'dl', p });
-async function load(model){
-  if (asr && loaded === model) return device;
+async function load(model, pref, mobile){
+  const gpu = await hasGPU();
+  // 手机浏览器单个标签页内存很小，自动模式下一律走 CPU + 8 位量化
+  const want = pref === 'wasm' ? 'wasm' : pref === 'webgpu' ? (gpu ? 'webgpu' : 'wasm') : (gpu && !mobile ? 'webgpu' : 'wasm');
+  const key = model + '|' + want;
+  if (asr && loaded === key) return device;
   if (asr) { try{ await asr.dispose(); }catch{} asr = null; }
-  device = (await hasGPU()) ? 'webgpu' : 'wasm';
+  device = want;
+  const f16 = !!(adapter && adapter.features && adapter.features.has('shader-f16'));
+  const gpuDtype = { encoder_model: (mobile && f16) ? 'fp16' : 'fp32', decoder_model_merged:'q4' };
   try {
     asr = await pipeline('automatic-speech-recognition', model, {
       device, progress_callback: progress,
-      dtype: device === 'webgpu' ? { encoder_model:'fp32', decoder_model_merged:'q4' } : 'q8'
+      dtype: device === 'webgpu' ? gpuDtype : 'q8'
     });
   } catch (err) {
     if (device !== 'webgpu') throw err;
     device = 'wasm';
     asr = await pipeline('automatic-speech-recognition', model, { device, dtype:'q8', progress_callback: progress });
   }
-  loaded = model;
+  loaded = model + '|' + device;
   return device;
 }
 self.onmessage = async (e) => {
   const m = e.data;
   try {
     if (m.type === 'probe') self.postMessage({ id:m.id, gpu: await hasGPU() });
-    if (m.type === 'load') self.postMessage({ id:m.id, device: await load(m.model) });
+    if (m.type === 'load') self.postMessage({ id:m.id, device: await load(m.model, m.pref, m.mobile) });
     if (m.type === 'run') {
       const opts = { task:'transcribe', return_timestamps:true };
       if (m.language) opts.language = m.language;
@@ -156,6 +170,10 @@ worker.onmessage = (e) => {
   const h = pending.get(m.id); if (!h) return; pending.delete(m.id);
   m.error ? h.reject(new Error(m.error)) : h.resolve(m);
 };
+worker.onerror = (e) => {
+  for (const h of pending.values()) h.reject(new Error('后台模型进程崩溃（通常是内存不足）'));
+  pending.clear();
+};
 const ask = (msg, transfer = []) => new Promise((resolve, reject) => {
   const id = ++seq; pending.set(id, { resolve, reject }); worker.postMessage({ ...msg, id }, transfer);
 });
@@ -166,7 +184,15 @@ const $ = (id) => document.getElementById(id);
 let audio = null, fileURL = '', nextIdx = 0, running = false, stopReq = false, segs = [], wakeLock = null;
 const setStatus = (t) => $('status').textContent = t;
 
-ask({ type:'probe' }).then(r => $('device').textContent = r.gpu ? '已启用 WebGPU 加速' : '未检测到 WebGPU，使用 CPU（较慢）');
+const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+if (isMobile) {
+  $('model').value = 'onnx-community/whisper-base';
+  $('dev').value = 'wasm';
+  $('model').querySelector('[value$="large-v3-turbo"]').disabled = true;
+}
+ask({ type:'probe' }).then(r => $('device').textContent =
+  isMobile ? '手机模式：建议 tiny 或 base，长录音更适合在电脑上转写'
+           : (r.gpu ? '检测到 WebGPU，可用显卡加速' : '未检测到 WebGPU，使用 CPU（较慢）'));
 
 // ---------- 读取音频：解码并重采样为 16 kHz 单声道 ----------
 async function decode(file) {
@@ -229,11 +255,11 @@ matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => audi
 async function run() {
   if (!audio || running) return;
   running = true; stopReq = false;
-  $('start').disabled = true; $('stop').disabled = false; $('model').disabled = true;
+  $('start').disabled = true; $('stop').disabled = false; $('model').disabled = true; $('dev').disabled = true;
   try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
   try {
     setStatus('正在加载模型…');
-    const r = await ask({ type:'load', model: $('model').value });
+    const r = await ask({ type:'load', model: $('model').value, pref: $('dev').value, mobile: isMobile });
     $('device').textContent = r.device === 'webgpu' ? '已启用 WebGPU 加速' : '使用 CPU 运行';
     const t0 = performance.now(), startIdx = nextIdx;
     while (nextIdx < audio.length && !stopReq) {
@@ -260,7 +286,7 @@ async function run() {
     setStatus('出错：' + err.message + '。可以换小一点的模型，或刷新页面后重试。');
     $('start').textContent = '继续转写';
   } finally {
-    running = false; $('start').disabled = false; $('stop').disabled = true; $('model').disabled = false;
+    running = false; $('start').disabled = false; $('stop').disabled = true; $('model').disabled = false; $('dev').disabled = false;
     try { await wakeLock?.release(); } catch {} wakeLock = null;
   }
 }
